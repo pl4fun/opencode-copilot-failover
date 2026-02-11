@@ -2,18 +2,48 @@
   "name": "opencode-copilot-failover",
   "version": "0.1.0",
   "description": "Auto-failover from anthropic/openai providers to github-copilot when primary providers return retryable errors",
-  "main": "index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "type": "module",
   "license": "MIT",
+  "author": "pl4fun",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pl4fun/opencode-copilot-failover.git"
+  },
+  "homepage": "https://github.com/pl4fun/opencode-copilot-failover#readme",
+  "bugs": {
+    "url": "https://github.com/pl4fun/opencode-copilot-failover/issues"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "copilot",
+    "failover",
+    "github-copilot",
+    "provider",
+    "auto-switch"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build && npm run test",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@opencode-ai/plugin": "^1.1.19",
-    "@opencode-ai/sdk": "^1.1.19"
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.1.19"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "^1.1.19",
+    "@opencode-ai/sdk": "^1.1.19",
     "@types/node": "^22",
     "typescript": "^5.8",
     "vitest": "latest"
