@@ -35,10 +35,10 @@ function makeProviderAuthError(): ProviderAuthError {
 	};
 }
 
-function makeMessageAbortedError(): MessageAbortedError {
+function makeMessageAbortedError(message = "The operation was aborted."): MessageAbortedError {
 	return {
 		name: "MessageAbortedError" as const,
-		data: { message: "aborted" },
+		data: { message },
 	};
 }
 
@@ -97,8 +97,16 @@ describe("isRetryableProviderError", () => {
 		expect(isRetryableProviderError(makeProviderAuthError())).toBe(false);
 	});
 
-	it("returns false for MessageAbortedError", () => {
-		expect(isRetryableProviderError(makeMessageAbortedError())).toBe(false);
+	it("returns true for generic MessageAbortedError", () => {
+		expect(isRetryableProviderError(makeMessageAbortedError())).toBe(true);
+	});
+
+	it("returns false for user-cancel MessageAbortedError", () => {
+		expect(
+			isRetryableProviderError(
+				makeMessageAbortedError("Operation canceled by user via Ctrl+C"),
+			),
+		).toBe(false);
 	});
 
 	it("returns false for MessageOutputLengthError", () => {
@@ -119,10 +127,48 @@ describe("isRetryableProviderError", () => {
 		).toBe(true);
 	});
 
+	it("returns true for APIError with timeout status 408", () => {
+		expect(
+			isRetryableProviderError(
+				makeAPIError({ statusCode: 408, isRetryable: false }),
+			),
+		).toBe(true);
+	});
+
+	it("returns true for APIError with quota message even without retryable status code", () => {
+		expect(
+			isRetryableProviderError(
+				makeAPIError({
+					statusCode: 403,
+					isRetryable: false,
+					message: "quota exceeded for this account",
+				}),
+			),
+		).toBe(true);
+	});
+
+	it("returns true for APIError with timeout text in response body", () => {
+		expect(
+			isRetryableProviderError(
+				makeAPIError({
+					statusCode: 400,
+					isRetryable: false,
+					message: "request failed",
+					responseBody: "upstream timed out while waiting",
+				}),
+			),
+		).toBe(true);
+	});
+
 	it("returns false for APIError with non-retryable status and isRetryable false", () => {
 		expect(
 			isRetryableProviderError(
-				makeAPIError({ statusCode: 400, isRetryable: false }),
+				makeAPIError({
+					statusCode: 400,
+					isRetryable: false,
+					message: "bad request",
+					responseBody: "validation error",
+				}),
 			),
 		).toBe(false);
 	});
@@ -160,9 +206,21 @@ describe("extractFailoverTrigger", () => {
 		expect(trigger!.reason).toContain("Unknown error");
 	});
 
-	it("returns null for MessageAbortedError", () => {
+	it("returns FailoverTrigger for generic MessageAbortedError", () => {
+		const trigger = extractFailoverTrigger(
+			makeSessionErrorEvent(makeMessageAbortedError()),
+		);
+		expect(trigger).not.toBeNull();
+		expect(trigger!.reason).toContain("MessageAbortedError");
+	});
+
+	it("returns null for user-cancel MessageAbortedError", () => {
 		expect(
-			extractFailoverTrigger(makeSessionErrorEvent(makeMessageAbortedError())),
+			extractFailoverTrigger(
+				makeSessionErrorEvent(
+					makeMessageAbortedError("Operation cancelled by user"),
+				),
+			),
 		).toBeNull();
 	});
 
@@ -172,5 +230,19 @@ describe("extractFailoverTrigger", () => {
 				makeSessionErrorEvent(makeMessageOutputLengthError()),
 			),
 		).toBeNull();
+	});
+
+	it("returns FailoverTrigger when APIError has usage-limit text signal", () => {
+		const trigger = extractFailoverTrigger(
+			makeSessionErrorEvent(
+				makeAPIError({
+					statusCode: 403,
+					isRetryable: false,
+					message: "usage limit reached",
+				}),
+			),
+		);
+		expect(trigger).not.toBeNull();
+		expect(trigger!.reason).toContain("usage limit reached");
 	});
 });

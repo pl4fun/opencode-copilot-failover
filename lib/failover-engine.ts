@@ -1,17 +1,26 @@
 import type {
 	EventSessionError,
+	EventTuiToastShow,
 	AssistantMessage,
+	UserMessage,
 	Part,
 	TextPartInput,
 	FilePartInput,
 	OpencodeClient,
 } from "@opencode-ai/sdk";
 
-import { COPILOT_PROVIDER_ID, LOG_PREFIX } from "./constants.js";
+import { COPILOT_PROVIDER_ID } from "./constants.js";
 import { extractFailoverTrigger } from "./error-detector.js";
-import { mapModelToCopilot } from "./model-mapper.js";
+import { resolveWithFallback } from "./model-mapper.js";
 
 type PromptPartInput = TextPartInput | FilePartInput;
+type ToastVariant = "info" | "success" | "warning" | "error";
+type ToastPayload = {
+	title?: string;
+	message: string;
+	variant: ToastVariant;
+	duration?: number;
+};
 
 /**
  * Detects provider errors, maps models to github-copilot equivalents,
@@ -19,18 +28,46 @@ type PromptPartInput = TextPartInput | FilePartInput;
  */
 export class CopilotFailoverEngine {
 	private readonly dedup = new Map<string, Set<string>>();
+	private cachedCopilotModels: Set<string> | null = null;
 
 	constructor(private readonly client: OpencodeClient) {}
+
+	/**
+	 * Discover which models are available in the github-copilot provider.
+	 * Result is cached for the lifetime of the engine instance.
+	 */
+	private async discoverCopilotModels(): Promise<Set<string> | null> {
+		if (this.cachedCopilotModels) return this.cachedCopilotModels;
+
+		try {
+			const result = await this.client.config.providers();
+			const providers = result.data?.providers;
+			if (!providers) return null;
+
+			const copilotProvider = providers.find(
+				(p) => p.id === COPILOT_PROVIDER_ID,
+			);
+			if (!copilotProvider?.models) return null;
+
+			this.cachedCopilotModels = new Set(
+				Object.keys(copilotProvider.models),
+			);
+			return this.cachedCopilotModels;
+		} catch {
+			// If the providers API fails, proceed without availability filtering
+			return null;
+		}
+	}
 
 	async handleSessionError(event: EventSessionError): Promise<void> {
 		try {
 			await this.processError(event);
 		} catch (err) {
-			console.log(
-				LOG_PREFIX,
-				"Unexpected error in failover engine:",
-				err,
-			);
+			await this.emitToast({
+				title: "Copilot Failover Error",
+				message: err instanceof Error ? err.message : String(err),
+				variant: "error",
+			}).catch(() => {});
 		}
 	}
 
@@ -41,70 +78,55 @@ export class CopilotFailoverEngine {
 		if (!sessionID) return;
 
 		const trigger = extractFailoverTrigger(event);
-		if (!trigger) {
-			console.log(LOG_PREFIX, `Non-retryable error for session ${sessionID}, skipping`);
-			return;
-		}
-
-		console.log(LOG_PREFIX, `Failover trigger: ${trigger.reason} (session: ${sessionID})`);
+		if (!trigger) return;
 
 		const messagesResult = await this.client.session.messages({
 			path: { id: sessionID },
 		});
 		const messages = messagesResult.data;
-		if (!messages || messages.length === 0) {
-			console.log(LOG_PREFIX, "No messages found in session");
-			return;
-		}
+		if (!messages || messages.length === 0) return;
 
 		const failedEntry = [...messages]
 			.reverse()
 			.find(
 				(m) => m.info.role === "assistant" && (m.info as AssistantMessage).error,
 			);
-		if (!failedEntry) {
-			console.log(LOG_PREFIX, "No failed assistant message found");
-			return;
-		}
+		if (!failedEntry) return;
 
 		const failedAssistant = failedEntry.info as AssistantMessage;
 		const originalProvider = failedAssistant.providerID;
 		const originalModel = failedAssistant.modelID;
 
-		// Prevent infinite loop — skip if already on copilot
 		if (originalProvider === COPILOT_PROVIDER_ID) {
-			console.log(LOG_PREFIX, "Already on copilot, skipping");
+			await this.emitToast({
+				title: "Copilot Failover Failed",
+				message: `${COPILOT_PROVIDER_ID}/${originalModel} also errored — no further fallback available`,
+				variant: "error",
+			});
 			return;
 		}
 
 		const parentID = failedAssistant.parentID;
-		if (this.isDuplicate(sessionID, parentID)) {
-			console.log(LOG_PREFIX, `Already failed over parentID ${parentID}, skipping`);
-			return;
-		}
+		if (this.isDuplicate(sessionID, parentID)) return;
 
-		const copilotModelID = mapModelToCopilot(originalModel);
+		const availableModels = await this.discoverCopilotModels();
+		const copilotModelID = resolveWithFallback(originalModel, availableModels);
 		if (!copilotModelID) {
-			console.log(LOG_PREFIX, `No copilot mapping for "${originalModel}", skipping`);
+			await this.emitToast({
+				title: "Copilot Failover Unavailable",
+				message: `No copilot mapping for ${originalProvider}/${originalModel}`,
+				variant: "error",
+			});
 			return;
 		}
 
 		const userEntry = messages.find((m) => m.info.id === parentID);
-		if (!userEntry) {
-			console.log(LOG_PREFIX, `User message ${parentID} not found, skipping`);
-			return;
-		}
+		if (!userEntry) return;
 
 		const inputParts = this.convertPartsToInput(userEntry.parts);
-		if (inputParts.length === 0) {
-			console.log(LOG_PREFIX, "No convertible parts found, skipping");
-			return;
-		}
+		if (inputParts.length === 0) return;
 
-		console.log(
-			LOG_PREFIX,
-			`Re-prompting ${sessionID} with ${COPILOT_PROVIDER_ID}/${copilotModelID}`,
-		);
+		const userInfo = userEntry.info as UserMessage;
 
 		await this.client.session.promptAsync({
 			path: { id: sessionID },
@@ -114,20 +136,65 @@ export class CopilotFailoverEngine {
 					providerID: COPILOT_PROVIDER_ID,
 					modelID: copilotModelID,
 				},
+				agent: userInfo.agent,
+				system: userInfo.system,
+				tools: userInfo.tools,
 			},
 		});
 
-		await this.client.tui.showToast({
-			body: {
-				title: "Provider Failover",
-				message: `Switched from ${originalProvider}/${originalModel} to ${COPILOT_PROVIDER_ID}/${copilotModelID}`,
-				variant: "warning",
-				duration: 5000,
-			},
-		});
+		await this.emitFailoverToast(
+			originalProvider,
+			originalModel,
+			copilotModelID,
+			trigger.reason,
+		);
 
 		this.recordDedup(sessionID, parentID);
-		console.log(LOG_PREFIX, "Failover complete");
+	}
+
+	private async emitFailoverToast(
+		fromProvider: string,
+		fromModel: string,
+		toModel: string,
+		reason: string,
+	): Promise<void> {
+		await this.emitToast({
+			title: "Provider switched to GitHub Copilot",
+			message: `${fromProvider}/${fromModel} → ${COPILOT_PROVIDER_ID}/${toModel} (${reason})`,
+			variant: "warning",
+		});
+	}
+
+	private async emitToast(payload: ToastPayload): Promise<void> {
+		const toastEvent: EventTuiToastShow = {
+			type: "tui.toast.show",
+			properties: {
+				title: payload.title,
+				message: payload.message,
+				variant: payload.variant,
+				duration: payload.duration,
+			},
+		};
+
+		try {
+			await this.client.tui.publish({ body: toastEvent });
+			return;
+		} catch {
+			// publish unavailable, fall through to showToast
+		}
+
+		try {
+			await this.client.tui.showToast({
+				body: {
+					title: payload.title,
+					message: payload.message,
+					variant: payload.variant,
+					duration: payload.duration,
+				},
+			});
+		} catch {
+			// both toast methods failed — nothing we can do without polluting TUI
+		}
 	}
 
 	/**

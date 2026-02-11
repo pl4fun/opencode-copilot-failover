@@ -7,6 +7,8 @@ import type {
   UnknownError,
 } from "@opencode-ai/sdk";
 
+import { RETRYABLE_STATUS_CODES } from "./constants.js";
+
 export type FailoverTrigger = {
   reason: string;
   statusCode?: number;
@@ -21,18 +23,45 @@ type SessionError =
   | MessageAbortedError
   | ApiError;
 
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 529] as const;
+const RETRYABLE_TEXT_SIGNALS = [
+  "rate limit",
+  "too many requests",
+  "quota",
+  "usage limit",
+  "billing limit",
+  "capacity",
+  "overloaded",
+  "service unavailable",
+  "temporarily unavailable",
+  "timeout",
+  "timed out",
+  "deadline exceeded",
+] as const;
+
+const USER_ABORT_TEXT_SIGNALS = [
+  "user cancelled",
+  "user canceled",
+  "cancelled by user",
+  "canceled by user",
+  "aborted by user",
+  "ctrl+c",
+  "ctrl-c",
+] as const;
 
 export function isRetryableProviderError(error: SessionError): boolean {
   switch (error.name) {
     case "APIError": {
       if (error.data.isRetryable) return true;
+      if (error.data.statusCode === 408) return true;
       if (
         error.data.statusCode !== undefined &&
         (RETRYABLE_STATUS_CODES as readonly number[]).includes(
           error.data.statusCode,
         )
       ) {
+        return true;
+      }
+      if (hasRetryableTextSignal(error.data.message, error.data.responseBody)) {
         return true;
       }
       return false;
@@ -42,7 +71,7 @@ export function isRetryableProviderError(error: SessionError): boolean {
       return false;
 
     case "MessageAbortedError":
-      return false;
+      return !isLikelyUserAbort(error.data.message);
 
     case "MessageOutputLengthError":
       return false;
@@ -55,6 +84,16 @@ export function isRetryableProviderError(error: SessionError): boolean {
       return _exhaustive;
     }
   }
+}
+
+function hasRetryableTextSignal(message: string, responseBody?: string): boolean {
+  const haystack = `${message}\n${responseBody ?? ""}`.toLowerCase();
+  return RETRYABLE_TEXT_SIGNALS.some((signal) => haystack.includes(signal));
+}
+
+function isLikelyUserAbort(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return USER_ABORT_TEXT_SIGNALS.some((signal) => normalized.includes(signal));
 }
 
 export function extractFailoverTrigger(
