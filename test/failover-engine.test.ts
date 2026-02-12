@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { EventSessionError, OpencodeClient } from "@opencode-ai/sdk";
+import type { EventSessionError, OpencodeClient, Part } from "@opencode-ai/sdk";
 import { CopilotFailoverEngine } from "../lib/failover-engine.js";
 
 const COPILOT_MODELS: Record<string, object> = {
@@ -10,6 +10,7 @@ const COPILOT_MODELS: Record<string, object> = {
 	"claude-sonnet-4": {},
 	"claude-haiku-4.5": {},
 	"gpt-5.2-codex": {},
+	"gpt-5.3-codex": {},
 	"gpt-5.1-codex-max": {},
 	"gpt-5.1-codex": {},
 	"gpt-5.1-codex-mini": {},
@@ -30,8 +31,12 @@ function createMockMessages(overrides?: {
 	modelID?: string;
 	errorName?: string;
 	agent?: string;
+	assistantAgent?: string;
 	system?: string;
 	tools?: Record<string, boolean>;
+	userVariant?: string;
+	assistantVariant?: string;
+	userParts?: Part[];
 }) {
 	const providerID = overrides?.providerID ?? "anthropic";
 	const modelID = overrides?.modelID ?? "claude-opus-4-6";
@@ -47,8 +52,9 @@ function createMockMessages(overrides?: {
 				model: { providerID, modelID },
 				system: overrides?.system,
 				tools: overrides?.tools,
+				variant: overrides?.userVariant,
 			},
-			parts: [
+			parts: overrides?.userParts ?? [
 				{
 					id: "part-1",
 					sessionID: "test-session-1",
@@ -68,6 +74,8 @@ function createMockMessages(overrides?: {
 				modelID,
 				providerID,
 				mode: "default",
+				agent: overrides?.assistantAgent ?? overrides?.agent ?? "sisyphus",
+				variant: overrides?.assistantVariant,
 				path: { cwd: "/tmp", root: "/tmp" },
 				cost: 0,
 				tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
@@ -237,10 +245,102 @@ describe("CopilotFailoverEngine", () => {
 		expect(promptCall.body.model.providerID).toBe("github-copilot");
 	});
 
+	it("preserves assistant agent when it differs from parent user agent", async () => {
+		const mixedAgentMessages = createMockMessages({
+			agent: "build",
+			assistantAgent: "explore",
+		});
+		const mixedAgentClient = createMockClient(mixedAgentMessages);
+		const mixedAgentEngine = new CopilotFailoverEngine(mixedAgentClient as unknown as OpencodeClient);
+
+		await mixedAgentEngine.handleSessionError(createErrorEvent());
+
+		const promptAsync = mixedAgentClient.session.promptAsync as ReturnType<typeof vi.fn>;
+		expect(promptAsync).toHaveBeenCalledTimes(1);
+		const promptCall = promptAsync.mock.calls[0][0] as {
+			body: { agent: string };
+		};
+		expect(promptCall.body.agent).toBe("explore");
+	});
+
+	it("preserves variant from failed assistant message", async () => {
+		const variantMessages = createMockMessages({
+			userVariant: "medium",
+			assistantVariant: "high",
+		});
+		const variantClient = createMockClient(variantMessages);
+		const variantEngine = new CopilotFailoverEngine(variantClient as unknown as OpencodeClient);
+
+		await variantEngine.handleSessionError(createErrorEvent());
+
+		const promptAsync = variantClient.session.promptAsync as ReturnType<typeof vi.fn>;
+		expect(promptAsync).toHaveBeenCalledTimes(1);
+		const promptCall = promptAsync.mock.calls[0][0] as {
+			body: Record<string, unknown>;
+		};
+		expect(promptCall.body.variant).toBeUndefined();
+	});
+
+	it("preserves agent and subtask parts when re-prompting", async () => {
+		const complexUserParts: Part[] = [
+			{
+				id: "text-part",
+				sessionID: "test-session-1",
+				messageID: "user-msg-1",
+				type: "text",
+				text: "Please continue",
+			},
+			{
+				id: "agent-part",
+				sessionID: "test-session-1",
+				messageID: "user-msg-1",
+				type: "agent",
+				name: "explore",
+				source: { value: "@explore", start: 0, end: 8 },
+			},
+			{
+				id: "subtask-part",
+				sessionID: "test-session-1",
+				messageID: "user-msg-1",
+				type: "subtask",
+				prompt: "Find fallback issues",
+				description: "Inspect mapping and ordering",
+				agent: "explore",
+			},
+		];
+		const partsClient = createMockClient(createMockMessages({ userParts: complexUserParts }));
+		const partsEngine = new CopilotFailoverEngine(partsClient as unknown as OpencodeClient);
+
+		await partsEngine.handleSessionError(createErrorEvent());
+
+		const promptAsync = partsClient.session.promptAsync as ReturnType<typeof vi.fn>;
+		expect(promptAsync).toHaveBeenCalledTimes(1);
+		const promptCall = promptAsync.mock.calls[0][0] as {
+			body: {
+				parts: Array<{ type: string; [key: string]: unknown }>;
+			};
+		};
+		expect(promptCall.body.parts.map((part) => part.type)).toEqual([
+			"text",
+			"agent",
+			"subtask",
+		]);
+		expect(promptCall.body.parts[1]).toMatchObject({
+			type: "agent",
+			name: "explore",
+		});
+		expect(promptCall.body.parts[2]).toMatchObject({
+			type: "subtask",
+			agent: "explore",
+			prompt: "Find fallback issues",
+			description: "Inspect mapping and ordering",
+		});
+	});
+
 	it("uses fallback when direct mapping not available in copilot", async () => {
 		const limitedClient = createMockClient(
 			createMockMessages({ providerID: "anthropic", modelID: "claude-opus-4-6" }),
-			{ "gpt-5.2-codex": {} },
+			{ "gpt-5.2": {} },
 		);
 		const limitedEngine = new CopilotFailoverEngine(limitedClient as unknown as OpencodeClient);
 
@@ -251,7 +351,7 @@ describe("CopilotFailoverEngine", () => {
 		const promptCall = promptAsync.mock.calls[0][0] as {
 			body: { model: { providerID: string; modelID: string } };
 		};
-		expect(promptCall.body.model.modelID).toBe("gpt-5.2-codex");
+		expect(promptCall.body.model.modelID).toBe("gpt-5.2");
 	});
 
 	it("caches providers result (only calls providers API once)", async () => {

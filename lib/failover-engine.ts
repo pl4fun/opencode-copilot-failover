@@ -6,6 +6,8 @@ import type {
 	Part,
 	TextPartInput,
 	FilePartInput,
+	AgentPartInput,
+	SubtaskPartInput,
 	OpencodeClient,
 } from "@opencode-ai/sdk";
 
@@ -13,7 +15,11 @@ import { COPILOT_PROVIDER_ID } from "./constants.js";
 import { extractFailoverTrigger } from "./error-detector.js";
 import { resolveWithFallback } from "./model-mapper.js";
 
-type PromptPartInput = TextPartInput | FilePartInput;
+type PromptPartInput =
+	| TextPartInput
+	| FilePartInput
+	| AgentPartInput
+	| SubtaskPartInput;
 type ToastVariant = "info" | "success" | "warning" | "error";
 type ToastPayload = {
 	title?: string;
@@ -127,19 +133,31 @@ export class CopilotFailoverEngine {
 		if (inputParts.length === 0) return;
 
 		const userInfo = userEntry.info as UserMessage;
+		const failoverAgent =
+			this.readOptionalStringField(failedAssistant, "agent") || userInfo.agent;
+		const promptBody: {
+			parts: PromptPartInput[];
+			model: {
+				providerID: string;
+				modelID: string;
+			};
+			agent: string;
+			system: UserMessage["system"];
+			tools: UserMessage["tools"];
+		} = {
+			parts: inputParts,
+			model: {
+				providerID: COPILOT_PROVIDER_ID,
+				modelID: copilotModelID,
+			},
+			agent: failoverAgent,
+			system: userInfo.system,
+			tools: userInfo.tools,
+		};
 
 		await this.client.session.promptAsync({
 			path: { id: sessionID },
-			body: {
-				parts: inputParts,
-				model: {
-					providerID: COPILOT_PROVIDER_ID,
-					modelID: copilotModelID,
-				},
-				agent: userInfo.agent,
-				system: userInfo.system,
-				tools: userInfo.tools,
-			},
+			body: promptBody,
 		});
 
 		await this.emitFailoverToast(
@@ -214,6 +232,23 @@ export class CopilotFailoverEngine {
 					});
 					break;
 				}
+				case "agent": {
+					result.push({
+						type: "agent",
+						name: part.name,
+						...(part.source ? { source: part.source } : {}),
+					});
+					break;
+				}
+				case "subtask": {
+					result.push({
+						type: "subtask",
+						prompt: part.prompt,
+						description: part.description,
+						agent: part.agent,
+					});
+					break;
+				}
 				case "file": {
 					result.push({
 						type: "file",
@@ -228,6 +263,13 @@ export class CopilotFailoverEngine {
 		}
 
 		return result;
+	}
+
+	private readOptionalStringField(data: unknown, field: string): string | undefined {
+		if (!data || typeof data !== "object") return undefined;
+		const record = data as Record<string, unknown>;
+		const value = record[field];
+		return typeof value === "string" ? value : undefined;
 	}
 
 	private isDuplicate(sessionID: string, parentID: string): boolean {

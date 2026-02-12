@@ -30,6 +30,7 @@ export const COPILOT_MODEL_MAP: Record<string, string> = {
 	"claude-haiku-4.5": "claude-haiku-4.5",
 
 	// OpenAI
+	"gpt-5.3-codex": "gpt-5.3-codex",
 	"gpt-5.2-codex": "gpt-5.2-codex",
 	"gpt-5.2": "gpt-5.2",
 	"gpt-5.1-codex-max": "gpt-5.1-codex-max",
@@ -56,26 +57,16 @@ export const COPILOT_MODEL_MAP: Record<string, string> = {
  * Fallback chain — ordered list of model IDs to try when the original
  * model isn't available in copilot. Walked top-to-bottom, first match wins.
  *
- * Order per user spec:
- *   1. claude-opus (latest)
- *   2. openai codex (latest)
- *   3. claude-sonnet (latest)
- *   4. kimi-2.5
- *   5. any remaining
+ * Tier order for coding fallback:
+ *   1. enforced prefix: opus-4.6 -> gpt-5.3-codex -> opus-4.5
+ *   2. remaining models ranked by fresh benchmark evidence (<= 1 month)
  */
 export const FALLBACK_CHAIN: readonly string[] = [
 	"claude-opus-4.6",
-	"claude-opus-4.5",
 	"gpt-5.3-codex",
-	"gpt-5.2-codex",
-	"claude-sonnet-4.5",
-	"kimi-2.5",
-	"gpt-5.2",
-	"gpt-5-mini",
+	"claude-opus-4.5",
 	"gemini-3-pro-preview",
-	"gemini-3-flash-preview",
-	"grok-code-fast-1",
-	"claude-haiku-4.5",
+	"gpt-5.2",
 ];
 
 export function parseModelString(fullModelID: string): {
@@ -133,6 +124,22 @@ export function resolveWithFallback(
 		return bare;
 	}
 
+	const freeNormalized = normalizeFreeModelID(bare);
+	if (freeNormalized && isAvailable(freeNormalized, availableModels)) {
+		return freeNormalized;
+	}
+
+	if (freeNormalized) {
+		const mappedFreeNormalized = mapModelToCopilot(freeNormalized);
+		if (
+			mappedFreeNormalized &&
+			mappedFreeNormalized !== freeNormalized &&
+			isAvailable(mappedFreeNormalized, availableModels)
+		) {
+			return mappedFreeNormalized;
+		}
+	}
+
 	// 2. Try the mapped name (e.g. claude-opus-4-6 -> claude-opus-4.6)
 	const mappedMatch = mapModelToCopilot(modelID);
 	if (mappedMatch && mappedMatch !== bare && isAvailable(mappedMatch, availableModels)) {
@@ -148,6 +155,12 @@ export function resolveWithFallback(
 	}
 
 	return null;
+}
+
+function normalizeFreeModelID(modelID: string): string | null {
+	if (!modelID.endsWith("-free")) return null;
+	const normalized = modelID.slice(0, -"-free".length);
+	return normalized.length > 0 ? normalized : null;
 }
 
 function isAvailable(
